@@ -3,7 +3,9 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	"github.com/gin-gonic/gin"
@@ -19,6 +21,7 @@ type CheckoutRequest struct {
 // CheckoutHandler handles POST /checkout requests.
 func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		rand.Seed(time.Now().UnixNano())
 		var req CheckoutRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
@@ -27,6 +30,9 @@ func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
 
 		ctx := c.Request.Context()
 		_, err := spannerClient.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			// Generate unique IDs for Order and Payment
+			orderID := rand.Int63()
+			paymentID := rand.Int63()
 			// Read all items from ShoppingCarts for the user
 			// Use a key range to read all ShoppingCarts rows for the user
 			cartIter := txn.Read(
@@ -90,24 +96,27 @@ func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
 				if err != nil {
 					return err
 				}
-				var price float64
+				var price spanner.NullNumeric
 				if err := row.Columns(&price); err != nil {
 					return err
 				}
-				total += price * float64(item.Quantity)
+				if !price.Valid {
+					return fmt.Errorf("price is NULL for product %d", item.ProductID)
+				}
+				priceFloat, _ := price.Numeric.Float64()
+				total += priceFloat * float64(item.Quantity)
 				orderItems = append(orderItems, spanner.Insert(
 					"OrderItems",
 					[]string{"OrderID", "OrderItemID", "ProductID", "Quantity", "PriceAtOrderUSD"},
-					[]interface{}{spanner.CommitTimestamp, int64(i + 1), item.ProductID, item.Quantity, price},
+					[]interface{}{orderID, int64(i + 1), item.ProductID, item.Quantity, price},
 				))
 			}
 
 			// Insert into Orders
-			orderID := spanner.CommitTimestamp
 			orderMutation := spanner.Insert(
 				"Orders",
 				[]string{"OrderID", "UserID", "OrderDate", "TotalAmountUSD", "OrderStatus"},
-				[]interface{}{orderID, req.UserID, spanner.CommitTimestamp, total, "PENDING"},
+				[]interface{}{orderID, req.UserID, spanner.CommitTimestamp, fmt.Sprintf("%f", total), "PENDING"},
 			)
 			if err := txn.BufferWrite([]*spanner.Mutation{orderMutation}); err != nil {
 				return err
@@ -122,7 +131,7 @@ func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
 			paymentMutation := spanner.Insert(
 				"Payments",
 				[]string{"PaymentID", "OrderID", "UserID", "AmountUSD", "Status"},
-				[]interface{}{spanner.CommitTimestamp, orderID, req.UserID, total, "INITIATED"},
+				[]interface{}{paymentID, orderID, req.UserID, fmt.Sprintf("%f", total), "INITIATED"},
 			)
 			if err := txn.BufferWrite([]*spanner.Mutation{paymentMutation}); err != nil {
 				return err
