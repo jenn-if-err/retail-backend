@@ -1,0 +1,137 @@
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"cloud.google.com/go/spanner"
+	"github.com/gin-gonic/gin"
+	"google.golang.org/api/iterator"
+)
+
+// CheckoutRequest represents the expected JSON body for /checkout
+// (e.g., { "user_id": 123 })
+type CheckoutRequest struct {
+	UserID int64 `json:"user_id"`
+}
+
+// CheckoutHandler handles POST /checkout requests.
+func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req CheckoutRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+			return
+		}
+
+		ctx := c.Request.Context()
+		_, err := spannerClient.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			// 1. Read all items from ShoppingCarts for the user
+			// Use a key range to read all ShoppingCarts rows for the user
+			cartIter := txn.Read(
+				ctx,
+				"ShoppingCarts",
+				spanner.KeyRange{
+					Start: spanner.Key{req.UserID},
+					End:   spanner.Key{req.UserID},
+					Kind:  spanner.ClosedOpen,
+				},
+				[]string{"ProductID", "Quantity"},
+			)
+			defer cartIter.Stop()
+
+			var cartItems []struct {
+				ProductID int64
+				Quantity  int64
+			}
+			for {
+				row, err := cartIter.Next()
+				if err == iterator.Done {
+					break
+				}
+				if err != nil {
+					return err
+				}
+				var item struct {
+					ProductID int64
+					Quantity  int64
+				}
+				if err := row.Columns(&item.ProductID, &item.Quantity); err != nil {
+					return err
+				}
+				cartItems = append(cartItems, item)
+			}
+
+			if len(cartItems) == 0 {
+				return fmt.Errorf("cart is empty")
+			}
+
+			// 2. Calculate total price by fetching product prices
+			var total float64
+			orderItems := make([]*spanner.Mutation, 0, len(cartItems))
+			for i, item := range cartItems {
+				stmt := spanner.Statement{
+					SQL:    "SELECT PriceUSD FROM Products WHERE ProductID = @pid",
+					Params: map[string]interface{}{"pid": item.ProductID},
+				}
+				row, err := txn.Query(ctx, stmt).Next()
+				if err != nil {
+					return err
+				}
+				var price float64
+				if err := row.Columns(&price); err != nil {
+					return err
+				}
+				total += price * float64(item.Quantity)
+				orderItems = append(orderItems, spanner.Insert(
+					"OrderItems",
+					[]string{"OrderID", "OrderItemID", "ProductID", "Quantity", "PriceAtOrderUSD"},
+					[]interface{}{spanner.CommitTimestamp, int64(i + 1), item.ProductID, item.Quantity, price},
+				))
+			}
+
+			// 3. Insert into Orders
+			orderID := spanner.CommitTimestamp
+			orderMutation := spanner.Insert(
+				"Orders",
+				[]string{"OrderID", "UserID", "OrderDate", "TotalAmountUSD", "OrderStatus"},
+				[]interface{}{orderID, req.UserID, spanner.CommitTimestamp, total, "PENDING"},
+			)
+			if err := txn.BufferWrite([]*spanner.Mutation{orderMutation}); err != nil {
+				return err
+			}
+
+			// 4. Insert OrderItems (already prepared above)
+			if err := txn.BufferWrite(orderItems); err != nil {
+				return err
+			}
+
+			// 5. Insert Payment
+			paymentMutation := spanner.Insert(
+				"Payments",
+				[]string{"PaymentID", "OrderID", "UserID", "AmountUSD", "Status"},
+				[]interface{}{spanner.CommitTimestamp, orderID, req.UserID, total, "INITIATED"},
+			)
+			if err := txn.BufferWrite([]*spanner.Mutation{paymentMutation}); err != nil {
+				return err
+			}
+
+			// 6. Delete ShoppingCarts rows for the user
+			for _, item := range cartItems {
+				m := spanner.Delete("ShoppingCarts", spanner.Key{req.UserID, item.ProductID})
+				if err := txn.BufferWrite([]*spanner.Mutation{m}); err != nil {
+					return err
+				}
+			}
+
+			return nil // commit
+		})
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "checkout successful"})
+	}
+}
