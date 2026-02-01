@@ -5,6 +5,7 @@ go 1.22
 require (
 	cloud.google.com/go/spanner v1.56.0
 	github.com/gin-gonic/gin v1.9.1
+	github.com/shopspring/decimal v1.4.0
 	google.golang.org/api v0.157.0
 	gopkg.in/yaml.v3 v3.0.1
 )
