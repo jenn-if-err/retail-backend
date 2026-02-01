@@ -27,14 +27,14 @@ func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
 
 		ctx := c.Request.Context()
 		_, err := spannerClient.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-			// 1. Read all items from ShoppingCarts for the user
+			// Read all items from ShoppingCarts for the user
 			// Use a key range to read all ShoppingCarts rows for the user
 			cartIter := txn.Read(
 				ctx,
 				"ShoppingCarts",
 				spanner.KeyRange{
 					Start: spanner.Key{req.UserID},
-					End:   spanner.Key{req.UserID},
+					End:   spanner.Key{req.UserID + 1},
 					Kind:  spanner.ClosedOpen,
 				},
 				[]string{"ProductID", "Quantity"},
@@ -63,11 +63,22 @@ func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
 				cartItems = append(cartItems, item)
 			}
 
+			// Fetch user email for debug
+			var userEmail string
+			userRow, err := txn.ReadRow(ctx, "Users", spanner.Key{req.UserID}, []string{"Email"})
+			if err == nil {
+				_ = userRow.Columns(&userEmail)
+			}
+
+			// Debug: log cart items and user email
+			fmt.Printf("[DEBUG] UserID: %d, Email: %s, CartItems: %v\n", req.UserID, userEmail, cartItems)
+
 			if len(cartItems) == 0 {
+				fmt.Printf("[DEBUG] Cart is empty for user %d (email: %s)\n", req.UserID, userEmail)
 				return fmt.Errorf("cart is empty")
 			}
 
-			// 2. Calculate total price by fetching product prices
+			// Calculate total price by fetching product prices
 			var total float64
 			orderItems := make([]*spanner.Mutation, 0, len(cartItems))
 			for i, item := range cartItems {
@@ -91,7 +102,7 @@ func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
 				))
 			}
 
-			// 3. Insert into Orders
+			// Insert into Orders
 			orderID := spanner.CommitTimestamp
 			orderMutation := spanner.Insert(
 				"Orders",
@@ -102,12 +113,12 @@ func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
 				return err
 			}
 
-			// 4. Insert OrderItems (already prepared above)
+			// Insert OrderItems
 			if err := txn.BufferWrite(orderItems); err != nil {
 				return err
 			}
 
-			// 5. Insert Payment
+			// Insert Payment
 			paymentMutation := spanner.Insert(
 				"Payments",
 				[]string{"PaymentID", "OrderID", "UserID", "AmountUSD", "Status"},
@@ -117,7 +128,7 @@ func CheckoutHandler(spannerClient *spanner.Client) gin.HandlerFunc {
 				return err
 			}
 
-			// 6. Delete ShoppingCarts rows for the user
+			// Delete ShoppingCarts rows for the user
 			for _, item := range cartItems {
 				m := spanner.Delete("ShoppingCarts", spanner.Key{req.UserID, item.ProductID})
 				if err := txn.BufferWrite([]*spanner.Mutation{m}); err != nil {
